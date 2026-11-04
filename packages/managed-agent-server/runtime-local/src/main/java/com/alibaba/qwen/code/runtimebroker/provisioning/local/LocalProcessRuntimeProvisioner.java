@@ -45,6 +45,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.regex.Pattern;
@@ -59,6 +61,9 @@ public final class LocalProcessRuntimeProvisioner
     public static final Duration READY_TIMEOUT = Duration.ofSeconds(30);
     private static final Duration GRACE_BEFORE_FORCE = Duration.ofSeconds(5);
     private static final int READY_RECORD_LIMIT = 32 * 1024;
+    private static final int MAX_CONCURRENT_STARTUPS = 32;
+    private static final ThreadFactory OUTPUT_READERS =
+            Thread.ofPlatform().daemon(true).name("runtime-ready-", 0).factory();
     private static final Pattern CAPABILITY_DIGEST =
             Pattern.compile("sha256:[0-9a-f]{64}");
     private static final SecureRandom RANDOM = new SecureRandom();
@@ -78,12 +83,9 @@ public final class LocalProcessRuntimeProvisioner
     private final boolean trustedRebootRecovery;
     private String managedExtensionCacheDirectory;
     private String managedExtensionCgroupRoot;
-    private final ExecutorService executor = Executors.newCachedThreadPool(
-            task -> {
-                Thread thread = new Thread(task, "runtime-provisioner");
-                thread.setDaemon(true);
-                return thread;
-            });
+    private final ExecutorService executor = Executors.newThreadPerTaskExecutor(
+            Thread.ofVirtual().name("runtime-provisioner-", 0).factory());
+    private final Semaphore startups = new Semaphore(MAX_CONCURRENT_STARTUPS);
     private final ConcurrentMap<List<Object>, OwnedProcess> owned =
             new ConcurrentHashMap<>();
     // Tombstones need only equality: store the SHA-256 of the canonical
@@ -209,8 +211,7 @@ public final class LocalProcessRuntimeProvisioner
     @Override
     public CompletionStage<RuntimeLease> provision(
             RuntimeProvisionRequest request) {
-        return CompletableFuture.supplyAsync(() -> start(request, null),
-                executor);
+        return submitStartup(request, null);
     }
 
     @Override
@@ -219,8 +220,27 @@ public final class LocalProcessRuntimeProvisioner
         if (seed == null) {
             throw new IllegalArgumentException("seed is required");
         }
-        return CompletableFuture.supplyAsync(() -> start(request, seed),
-                executor);
+        return submitStartup(request, seed);
+    }
+
+    private CompletionStage<RuntimeLease> submitStartup(RuntimeProvisionRequest request, RuntimeProvisionSeed seed) {
+        try {
+            return CompletableFuture.supplyAsync(() -> {
+                // Acquire inside the task: cancelling a future must neither leak
+                // a queued permit nor release one while startup is still running.
+                if (!startups.tryAcquire()) {
+                    throw new RuntimeBrokerException(503, "runtime_local_capacity",
+                            "Local Runtime startup capacity is exhausted.", true);
+                }
+                try {
+                    return start(request, seed);
+                } finally {
+                    startups.release();
+                }
+            }, executor);
+        } catch (RejectedExecutionException closed) {
+            return CompletableFuture.failedFuture(failed("Managed Runtime provisioner is closed.", closed));
+        }
     }
 
     @Override
@@ -989,6 +1009,9 @@ public final class LocalProcessRuntimeProvisioner
                 throw failure;
             }
             throw failed("Managed Runtime attestation failed.", exception);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw failed("Managed Runtime attestation interrupted.", exception);
         } catch (Exception exception) {
             throw failed("Managed Runtime attestation failed.", exception);
         }
@@ -996,32 +1019,18 @@ public final class LocalProcessRuntimeProvisioner
 
     private static String readReadyLine(Process process) throws IOException {
         CompletableFuture<String> line = new CompletableFuture<>();
-        Thread reader = new Thread(() -> {
-            BufferedReader input = new BufferedReader(new InputStreamReader(
-                    process.getInputStream(), StandardCharsets.UTF_8.newDecoder()));
-            try {
-                line.complete(readLine(input, true));
-            } catch (Throwable throwable) {
-                line.completeExceptionally(throwable);
-            }
-            // The worker treats a closed stdout pipe as fatal, so keep the
-            // pipe open and drained for the worker's lifetime.
-            try {
-                while (readLine(input, false) != null) {
-                    // Discard everything the worker prints after ready.
-                }
-            } catch (Throwable ignored) {
-                // The worker is gone; nothing left to drain.
-            }
-        }, "runtime-ready");
-        reader.setDaemon(true);
-        reader.start();
+        // Java 21 process-pipe reads can pin virtual carriers. Keep their
+        // lifetime independent of startup capacity and control operations.
+        OUTPUT_READERS.newThread(() -> drainWorkerOutput(process, line)).start();
         String ready;
         try {
             ready = line.get(READY_TIMEOUT.toMillis(),
                     TimeUnit.MILLISECONDS);
         } catch (Exception exception) {
             process.destroyForcibly();
+            if (exception instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             if (exception instanceof ExecutionException
                     && exception
                             .getCause() instanceof RuntimeBrokerException failure) {
@@ -1035,6 +1044,25 @@ public final class LocalProcessRuntimeProvisioner
             throw failed("Managed Runtime worker closed before ready.");
         }
         return ready;
+    }
+
+    private static void drainWorkerOutput(Process process, CompletableFuture<String> line) {
+        BufferedReader input = new BufferedReader(new InputStreamReader(
+                process.getInputStream(), StandardCharsets.UTF_8.newDecoder()));
+        try {
+            line.complete(readLine(input, true));
+        } catch (Throwable throwable) {
+            line.completeExceptionally(throwable);
+        }
+        // The worker treats a closed stdout pipe as fatal, so keep the
+        // pipe open and drained for the worker's lifetime.
+        try {
+            while (readLine(input, false) != null) {
+                // Discard everything the worker prints after ready.
+            }
+        } catch (Throwable ignored) {
+            // The worker is gone; nothing left to drain.
+        }
     }
 
     private static String readLine(BufferedReader input, boolean bounded)
