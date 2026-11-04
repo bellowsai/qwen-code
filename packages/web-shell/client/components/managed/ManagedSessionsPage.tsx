@@ -20,6 +20,7 @@ import {
 import { ChatEditor } from '../ChatEditor';
 import type { WorkspaceSelectorOption } from '../WorkspaceSelector';
 import { WelcomeHeader } from '../WelcomeHeader';
+import { useWebShellCustomization } from '../../customization';
 import { ChatContextHeader } from '../ChatContextHeader';
 import { SessionRenameDialog } from '../dialogs/SessionRenameDialog';
 import type {
@@ -356,6 +357,16 @@ function ManagedSessionsContent({
   navigationSearch: string;
 }) {
   const { t, language } = useI18n();
+  // 宿主定制（欢迎头等）经 WebShellCustomizationProvider 已传入；此前 Managed 页未消费，
+  // 导致同一宿主下 Managed 与普通会话呈现两套欢迎区。这里与普通分支同一口径消费。
+  // 与 ChatPane 消费同一份 customization：宿主传入的定制品此处同样生效，
+  // 不新增宿主 API；此前只有 WelcomeHeader 被消费，导致 Managed 与 ordinary 呈现两套外壳。
+  const {
+    renderWelcomeHeader,
+    renderComposerFooter: CustomComposerFooter,
+    showManagedSessionHeader = true,
+    alignManagedChatWithHost = false,
+  } = useWebShellCustomization();
   const recoveryText = useManagedRecoveryText();
   const home = hostSessionOnly || navigationTarget !== undefined;
   const clientId = useMemo(
@@ -1752,7 +1763,7 @@ function ManagedSessionsContent({
           }
           aria-label={t('managed.conversation')}
         >
-          {summary && home && (
+          {summary && home && showManagedSessionHeader && (
             <div className="shrink-0">
               <ChatContextHeader
                 content={
@@ -2020,12 +2031,19 @@ function ManagedSessionsContent({
                     messages.length === 0 &&
                     !detail.loading &&
                     !summary?.failure ? (
-                      <WelcomeHeader
-                        version=""
-                        cwd=""
-                        currentModel={displayedModel}
-                        currentMode=""
-                      />
+                      (() => {
+                        const welcomeProps = {
+                          version: '',
+                          cwd: '',
+                          currentModel: displayedModel,
+                          currentMode: '',
+                        };
+                        return renderWelcomeHeader ? (
+                          renderWelcomeHeader(welcomeProps)
+                        ) : (
+                          <WelcomeHeader {...welcomeProps} />
+                        );
+                      })()
                     ) : undefined
                   }
                 />
@@ -2477,7 +2495,9 @@ function ManagedSessionsContent({
                 placeholderText={t(
                   active && userMessages.supported
                     ? 'managed.queue.placeholder'
-                    : 'managed.prompt',
+                    : alignManagedChatWithHost
+                      ? 'splitView.composerPlaceholder'
+                      : 'managed.prompt',
                 )}
               />
               {userMessages.snapshot && (
@@ -2691,12 +2711,21 @@ function ManagedSessionsContent({
                     )}
                   </p>
                 )}
-              {displayedModel && !modelChange.supported && (
+              {CustomComposerFooter && (
+                <CustomComposerFooter
+                  disabled={busy || Boolean(sessionId && summary && !summary.capabilities.canSend)}
+                  isRunning={Boolean(active)}
+                  currentMode={summary?.approvalMode ?? 'default'}
+                  currentModel={displayedModel ?? ''}
+                  sessionName={summary?.title}
+                />
+              )}
+              {!CustomComposerFooter && !alignManagedChatWithHost && displayedModel && !modelChange.supported && (
                 <p className="text-xs text-muted-foreground">
                   {t('managed.modelFixed')}
                 </p>
               )}
-              {summary?.approvalMode && !approvalChange.supported && (
+              {!CustomComposerFooter && !alignManagedChatWithHost && summary?.approvalMode && !approvalChange.supported && (
                 <p className="text-xs text-muted-foreground">
                   {t('managed.approvalFixed')}
                 </p>
@@ -2712,9 +2741,11 @@ function ManagedSessionsContent({
                     !active &&
                     summary &&
                     !summary.capabilities.canSend && (
-                      <span className="mr-auto text-sm text-muted-foreground">
-                        {t('managed.newRequired')}
-                      </span>
+                      !alignManagedChatWithHost && (
+                        <span className="mr-auto text-sm text-muted-foreground">
+                          {t('managed.newRequired')}
+                        </span>
+                      )
                     )}
                   {(!home || Boolean(text.trim())) && cancelButton}
                 </div>
